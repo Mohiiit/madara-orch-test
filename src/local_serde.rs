@@ -15,7 +15,12 @@ pub fn parse_state_diffs(data: &[BigUint]) -> Vec<ContractUpdate> {
     let mut updates = Vec::new();
     let mut i = 0;
     let contract_updated_num = data[i].to_usize().unwrap();
-    i += 1;
+
+    println!(
+        "number of contracts updated is  {:?} ",
+        contract_updated_num,
+    );
+    i += 5;
 
     for _ in 0..contract_updated_num {
         let address = data[i].clone();
@@ -31,21 +36,51 @@ pub fn parse_state_diffs(data: &[BigUint]) -> Vec<ContractUpdate> {
         let info_word = &data[i];
         i += 1;
 
+        let binary_string = format!("{:b}", info_word);
+        let padding = 256 - binary_string.len();
+        let padded_binary_string = format!("{:0>256}", binary_string);
+
         // TODO verify info_word len
-        let class_info_flag = extract_bits(&info_word, 0, 1);
-        let new_class_hash = if class_info_flag == BigUint::one() {
+        // let class_info_flag = extract_bits(&info_word, 0, 1);
+        // let new_class_hash = if class_info_flag == BigUint::one() {
+        //     i += 1;
+        //     Some(data[i].clone())
+        // } else {
+        //     None
+        // };
+
+        // // Nonce are the next 64 bits
+        // // TODO verify info_word len
+        // let nonce = extract_bits(&info_word, 1, 65).to_u64().unwrap();
+        // // Number of storage updates are the next 64 bits
+        // // TODO verify info_word len
+        // let number_of_storage_updates = extract_bits(&info_word, 66, 129).to_u64().unwrap();
+
+        // let (class_info_flag_biguint, nonce_biguint, number_of_storage_updates_bigunit) =
+        //     new_extract_bits(info_word);
+        // let new_class_hash = if class_info_flag_biguint == BigUint::one() {
+        //     i += 1;
+        //     Some(data[i].clone())
+        // } else {
+        //     None
+        // };
+
+        // let number_of_storage_updates = number_of_storage_updates_bigunit.to_u64().unwrap();
+        // let nonce = nonce_biguint.to_u64().unwrap();
+
+        let (class_flag, nonce, number_of_storage_updates) = parse_bitstring(&padded_binary_string);
+
+        println!(
+            "storage updates in the address here is  {:?}, {:?}, {:?}, {:?} ",
+            number_of_storage_updates, nonce, class_flag, padded_binary_string
+        );
+
+        let new_class_hash = if class_flag {
             i += 1;
             Some(data[i].clone())
         } else {
             None
         };
-
-        // Nonce are the next 64 bits
-        // TODO verify info_word len
-        let nonce = extract_bits(&info_word, 1, 65).to_u64().unwrap();
-        // Number of storage updates are the next 64 bits
-        // TODO verify info_word len
-        let number_of_storage_updates = extract_bits(&info_word, 66, 129).to_u64().unwrap();
 
         let mut storage_updates = Vec::new();
         for _ in 0..number_of_storage_updates {
@@ -72,6 +107,11 @@ pub fn parse_state_diffs(data: &[BigUint]) -> Vec<ContractUpdate> {
             storage_updates,
         });
     }
+
+    println!(
+        "number of contracts really got updated is  {:?} ",
+        updates.len(),
+    );
 
     updates
 }
@@ -131,4 +171,30 @@ fn extract_bits(word: &BigUint, start: usize, end: usize) -> BigUint {
         let bits = BigUint::from_str_radix(&bit_string, 2).unwrap_or_default();
         bits
     }
+}
+
+fn new_extract_bits(word: &BigUint) -> (BigUint, BigUint, BigUint) {
+    let class_flag = (word >> 127) & BigUint::one();
+    let new_nonce = (word >> 63) & ((BigUint::one() << 64) - BigUint::one());
+    let num_changes = word & ((BigUint::one() << 63) - BigUint::one());
+
+    (class_flag, new_nonce, num_changes)
+}
+
+fn parse_bitstring(bitstring: &str) -> (bool, u64, u64) {
+    if bitstring.len() != 256 {
+        panic!("Input string must be 256 bits long");
+    }
+
+    let class_flag_bit = &bitstring[127..128];
+    let new_nonce_bits = &bitstring[128..192];
+    let num_changes_bits = &bitstring[192..256];
+
+    let class_flag = class_flag_bit == "1";
+    let new_nonce =
+        u64::from_str_radix(new_nonce_bits, 2).expect("Invalid binary string for new nonce");
+    let num_changes =
+        u64::from_str_radix(num_changes_bits, 2).expect("Invalid binary string for num changes");
+
+    (class_flag, new_nonce, num_changes)
 }

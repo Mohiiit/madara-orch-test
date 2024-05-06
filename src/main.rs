@@ -169,17 +169,17 @@ fn state_update_to_blob_data(block_no: u64, state_update: StateUpdate) -> Vec<Fi
         let nonce = nonces.remove(&addr);
         let da_word_here = da_word(class_flag.is_some(), nonce, writes.len() as u64);
         let (class_flag_here, nonce_here, change_here) = decode_da_word(da_word_here);
-        println!(
-            "all the data here is {:?},{:?},{:?},{:?},{:?},{:?},{:?},{:?}, ",
-            addr,
-            class_flag,
-            nonce,
-            writes.len(),
-            da_word_here,
-            class_flag_here,
-            nonce_here,
-            change_here
-        );
+        // println!(
+        //     "all the data here is {:?},{:?},{:?},{:?},{:?},{:?},{:?},{:?}, ",
+        //     addr,
+        //     class_flag,
+        //     nonce,
+        //     writes.len(),
+        //     da_word_here,
+        //     class_flag_here,
+        //     nonce_here,
+        //     change_here
+        // );
         //all the data here is None,None,3,FieldElement { inner: 0x0000000000000000000000000000000000000000000000000000000000000003 },false,0,3,
         //all the data here is None,Some(FieldElement { inner: 0x0000000000000000000000000000000000000000000000000000000000000200 }),0,FieldElement { inner: 0x00000000000000000000000000000000000000000000000100000000000001ff },false,1,511,
         // all the data here is None,Some(FieldElement { inner: 0x00000000000000000000000000000000000000000000000000000000000004e2 }),0,FieldElement { inner: 0x00000000000000000000000000000000000000000000000100000000000004e1 },false,1,1249,
