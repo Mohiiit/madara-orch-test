@@ -1,4 +1,3 @@
-
 use alloy::{
     consensus::{
         BlobTransactionSidecar, SignableTransaction, TxEip4844, TxEip4844Variant,
@@ -33,10 +32,14 @@ use std::{env, path::Path};
 
 use lazy_static::lazy_static;
 use majin_blob_core::blob;
-use majin_blob_types::serde;
+// use majin_blob_types::serde;
 use num_bigint::{BigUint, ToBigUint};
 use num_traits::Num;
 use num_traits::{One, Zero};
+
+mod local_serde;
+mod local_state_diff;
+
 // use eyre::Result;
 
 pub const BLOB_LEN: usize = 4096;
@@ -55,7 +58,6 @@ lazy_static! {
     .unwrap();
     pub static ref TWO: BigUint = 2u32.to_biguint().unwrap();
 }
-
 
 async fn send_Tx_4844(block_no: u64) -> Result<()> {
     dotenv().ok();
@@ -80,22 +82,25 @@ async fn send_Tx_4844(block_no: u64) -> Result<()> {
 
     let biguint_vec = convert_to_biguint(state_update_value);
 
-    let self_state_diffs = serde::parse_state_diffs(biguint_vec.as_slice());
-    let self_state_diffs_json = serde::to_json(&self_state_diffs.as_slice());
+    let write_to_file = write_biguint_to_file(&biguint_vec, "state_file.txt")
+        .expect("issue while writing it to the file");
+
+    let self_state_diffs = local_serde::parse_state_diffs(biguint_vec.as_slice());
+    let self_state_diffs_json = local_serde::to_json(&self_state_diffs.as_slice());
     fs::write("self_json_creation.txt", self_state_diffs_json)?;
 
-    
-    
-    let blob_data = serde::parse_file_to_blob_data("./test_blob.txt");
+    let blob_data = local_serde::parse_file_to_blob_data("./test_blob_v2.txt");
 
     // Recover the original data
     let original_data = blob::recover(blob_data);
-    let state_diffs = serde::parse_state_diffs(original_data.as_slice());
-    let state_diffs_json = serde::to_json(state_diffs.as_slice());
+
+    let write_to_file = write_biguint_to_file(&original_data, "state_file_recover_fn.txt")
+        .expect("issue while writing it to the file");
+    let state_diffs = local_serde::parse_state_diffs(original_data.as_slice());
+    let state_diffs_json = local_serde::to_json(state_diffs.as_slice());
     fs::write("from_recover_json.txt", state_diffs_json)?;
 
-
-    Ok(()) 
+    Ok(())
 }
 pub fn get_env_var(key: &str) -> Result<String> {
     dotenv().ok();
@@ -106,6 +111,14 @@ pub fn get_env_var(key: &str) -> Result<String> {
 
 pub fn get_env_var_or_panic(key: &str) -> String {
     get_env_var(key).unwrap_or_else(|e| panic!("Failed to get env var {}: {}", key, e))
+}
+
+fn write_biguint_to_file(numbers: &Vec<BigUint>, file_path: &str) -> io::Result<()> {
+    let mut file = File::create(file_path)?;
+    for number in numbers {
+        writeln!(file, "{}", number)?;
+    }
+    Ok(())
 }
 
 fn state_update_to_blob_data(block_no: u64, state_update: StateUpdate) -> Vec<FieldElement> {
@@ -154,7 +167,23 @@ fn state_update_to_blob_data(block_no: u64, state_update: StateUpdate) -> Vec<Fi
             .or_else(|| replaced_classes.get(&addr));
 
         let nonce = nonces.remove(&addr);
-        blob_data.push(da_word(class_flag.is_some(), nonce, writes.len() as u64));
+        let da_word_here = da_word(class_flag.is_some(), nonce, writes.len() as u64);
+        let (class_flag_here, nonce_here, change_here) = decode_da_word(da_word_here);
+        println!(
+            "all the data here is {:?},{:?},{:?},{:?},{:?},{:?},{:?},{:?}, ",
+            addr,
+            class_flag,
+            nonce,
+            writes.len(),
+            da_word_here,
+            class_flag_here,
+            nonce_here,
+            change_here
+        );
+        //all the data here is None,None,3,FieldElement { inner: 0x0000000000000000000000000000000000000000000000000000000000000003 },false,0,3,
+        //all the data here is None,Some(FieldElement { inner: 0x0000000000000000000000000000000000000000000000000000000000000200 }),0,FieldElement { inner: 0x00000000000000000000000000000000000000000000000100000000000001ff },false,1,511,
+        // all the data here is None,Some(FieldElement { inner: 0x00000000000000000000000000000000000000000000000000000000000004e2 }),0,FieldElement { inner: 0x00000000000000000000000000000000000000000000000100000000000004e1 },false,1,1249,
+        blob_data.push(da_word_here);
 
         if let Some(class_hash) = class_flag {
             blob_data.push(*class_hash);
@@ -217,6 +246,25 @@ fn da_word(class_flag: bool, nonce_change: Option<FieldElement>, num_changes: u6
     word
 }
 
+fn decode_da_word(word: FieldElement) -> (bool, u64, u64) {
+    let bytes = word.to_bytes_be();
+
+    // Extract the class flag (1 bit)
+    let class_flag = (bytes[0] & 0b10000000) != 0;
+
+    // Extract the new nonce (64 bits)
+    let mut nonce_bytes = [0u8; 8];
+    nonce_bytes.copy_from_slice(&bytes[16..24]);
+    let new_nonce = u64::from_be_bytes(nonce_bytes);
+
+    // Extract the number of changes (64 bits)
+    let mut num_changes_bytes = [0u8; 8];
+    num_changes_bytes.copy_from_slice(&bytes[24..32]);
+    let num_changes = u64::from_be_bytes(num_changes_bytes);
+
+    (class_flag, new_nonce, num_changes)
+}
+
 fn convert_to_biguint(elements: Vec<FieldElement>) -> Vec<BigUint> {
     let mut biguint_vec = Vec::with_capacity(4096);
 
@@ -240,6 +288,6 @@ fn convert_to_biguint(elements: Vec<FieldElement>) -> Vec<BigUint> {
 }
 #[tokio::main]
 async fn main() -> Result<()> {
-    send_Tx_4844(630872).await?;
+    send_Tx_4844(637131).await?;
     Ok(())
 }
