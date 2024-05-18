@@ -30,17 +30,30 @@ pub fn parse_state_diffs(data: &[BigUint]) -> DataJson {
             break;
         }
         let info_word = &data[i];
-        i += 1;
 
         let (class_flag, nonce, number_of_storage_updates) = extract_bits(&info_word);
 
+        if (info_word
+            == &BigUint::from_str_radix("340282366920938464846880412959984582656", 10).unwrap())
+        {
+            println!(
+                "parser data here is:  {:?},{:?},{:?}, ",
+                class_flag, nonce, number_of_storage_updates
+            );
+        }
+
         let new_class_hash = if class_flag {
             i += 1;
+            if (info_word
+                == &BigUint::from_str_radix("340282366920938464846880412959984582656", 10).unwrap())
+            {
+                println!("new class hash is {:?}, ", data[i].clone());
+            }
             Some(data[i].clone())
         } else {
             None
         };
-
+        i += 1;
         let mut storage_updates = Vec::new();
         for _ in 0..number_of_storage_updates {
             // Break after blob data len

@@ -32,3 +32,4 @@ majin-blob-core = "0.1.3"
 majin-blob-types = "0.1.3"
 num-bigint = "0.4.4"
 serde = { version = "1.0.196", default-features = false, features = ["derive"] }
+rayon = "1.10.0"
