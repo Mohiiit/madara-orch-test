@@ -17,6 +17,7 @@ use starknet::core::types::{
     BlockId, FieldElement, MaybePendingStateUpdate, StateUpdate, StorageEntry,
 };
 use starknet::providers::jsonrpc::HttpTransport;
+use starknet::providers::jsonrpc::JsonRpcResponse::Success;
 use std::collections::HashSet;
 
 // use starknet::providers::Provider;
@@ -39,13 +40,18 @@ use majin_blob_core::blob;
 use num_bigint::{BigUint, ToBigUint};
 use num_traits::Num;
 use num_traits::{One, Zero};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::hash::{Hash, Hasher};
 use std::ops::{Add, Mul, Rem};
 
 mod constant;
 mod local_serde;
 mod local_state_diff;
+use httpmock::prelude::*;
+use std::io::Read;
 
-use constant::GENERATOR;
+use constant::{BLS_MODULUS, GENERATOR};
 use rayon::prelude::*;
 
 // use eyre::Result;
@@ -55,58 +61,248 @@ lazy_static! {
     pub static ref TWO: BigUint = 2u32.to_biguint().unwrap();
     pub static ref ONE: BigUint = 1u32.to_biguint().unwrap();
 }
+
+#[derive(Serialize, Deserialize, Debug)]
+struct NonceAddress {
+    nonce: String,
+    address: String,
+}
+async fn state_update_to_blob_data(
+    block_no: u64,
+    state_update: StateUpdate,
+    provider: JsonRpcClient<HttpTransport>,
+) -> Result<Vec<FieldElement>> {
+    let state_diff = state_update.state_diff;
+    let mut blob_data: Vec<FieldElement> = vec![
+        // TODO: confirm first three fields
+        // TODO: should be number of unique addresses over here
+        FieldElement::from(state_diff.storage_diffs.len()),
+        FieldElement::ONE,
+        FieldElement::ONE,
+        FieldElement::from(block_no),
+        state_update.block_hash,
+    ];
+
+    let storage_diffs: HashMap<FieldElement, &Vec<StorageEntry>> = state_diff
+        .storage_diffs
+        .iter()
+        .map(|item| (item.address, &item.storage_entries))
+        .collect();
+    let declared_classes: HashMap<FieldElement, FieldElement> = state_diff
+        .declared_classes
+        .iter()
+        .map(|item| (item.class_hash, item.compiled_class_hash))
+        .collect();
+    let deployed_contracts: HashMap<FieldElement, FieldElement> = state_diff
+        .deployed_contracts
+        .iter()
+        .map(|item| (item.address, item.class_hash))
+        .collect();
+    let replaced_classes: HashMap<FieldElement, FieldElement> = state_diff
+        .replaced_classes
+        .iter()
+        .map(|item| (item.contract_address, item.class_hash))
+        .collect();
+    let mut nonces: HashMap<FieldElement, FieldElement> = state_diff
+        .nonces
+        .iter()
+        .map(|item| (item.contract_address, item.nonce))
+        .collect();
+
+    // Loop over storage diffs
+    // let mut nonce_address_pairs = Vec::new();
+    for (addr, writes) in storage_diffs {
+        // compare_the_field_element_with_da_word(addr, "address was this".to_string());
+
+        let class_flag = deployed_contracts
+            .get(&addr)
+            .or_else(|| replaced_classes.get(&addr));
+
+        let mut nonce = nonces.remove(&addr);
+
+        // @note: if nonce is null and there is some len of writes, make an api call to get the contract nonce for the block
+        if (nonce.is_none() && writes.len() > 0 && addr != FieldElement::ONE) {
+            println!(
+                "data while checking is: {:?}, {:?}, {:?}",
+                nonce,
+                writes.len(),
+                addr
+            );
+            let get_current_nonce = provider.get_nonce(BlockId::Number(block_no), addr).await?;
+            println!("data recieved is: {:?}", get_current_nonce);
+            nonce = Some(get_current_nonce);
+        }
+        let da_word_here = da_word(class_flag.is_some(), nonce, writes.len() as u64);
+
+        if (addr == FieldElement::ONE && da_word_here == FieldElement::ONE) {
+            continue;
+        }
+        blob_data.push(addr);
+        blob_data.push(da_word_here);
+
+        if let Some(class_hash) = class_flag {
+            blob_data.push(*class_hash);
+        }
+
+        for entry in writes {
+            blob_data.push(entry.key);
+            blob_data.push(entry.value);
+        }
+    }
+
+    // let json = serde_json::to_string_pretty(&nonce_address_pairs)
+    //     .expect("Failed to serialize nonce_address_pairs");
+    // let mut file = File::create(format!("nonces_from_block_{}.txt", block_no).as_str())?;
+    // file.write_all(json.as_bytes())?;
+
+    blob_data.push(FieldElement::from(declared_classes.len()));
+
+    for (class_hash, compiled_class_hash) in &declared_classes {
+        blob_data.push(*class_hash);
+        blob_data.push(*compiled_class_hash);
+    }
+
+    Ok(blob_data)
+}
+
+pub fn get_nonce_attached(server: &MockServer, block_no: u64) {
+    // Read the file
+    let file_path = format!("nonces_from_block_{}.txt", block_no);
+    let file_content = fs::read_to_string(file_path).expect("Unable to read file");
+
+    // Parse the JSON content into a vector of NonceAddress
+    let nonce_addresses: Vec<NonceAddress> =
+        serde_json::from_str(&file_content).expect("JSON was not well-formatted");
+
+    // server.mock(|when, then| {
+    //     when.any_request();
+    //     then.status(200).json_body(json!({
+    //         "id": 0,
+    //         "result": FieldElement::from_hex_be("49d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7").expect("issue in result")
+    //     }));
+    // });
+
+    // Set up mocks for each entry
+    for entry in nonce_addresses {
+        let address = entry.address.clone();
+        let nonce = entry.nonce.clone();
+        let response = json!({ "id": 1,"jsonrpc":"2.0","result": nonce });
+        let field_element = FieldElement::from_dec_str(&address)
+            .expect("issue while converting the hex to field")
+            .to_bytes_be();
+        let hex_field_element = vec_u8_to_hex_string(&field_element);
+        println!(
+            "data recieved in the nonce setter is: {:?}, {:?}, {:?}, {:?}",
+            address, nonce, hex_field_element, nonce
+        );
+        let state_update_mock = server.mock(|when, then| {
+            when.path("/")
+                .body_contains("starknet_getNonce")
+                .body_contains(hex_field_element);
+            then.status(200)
+                .body(serde_json::to_vec(&response).unwrap());
+        });
+    }
+
+    println!("all the mocks are done");
+}
+
+fn vec_u8_to_hex_string(data: &[u8]) -> String {
+    let hex_chars: Vec<String> = data.iter().map(|byte| format!("{:02x}", byte)).collect();
+
+    let mut new_hex_chars = hex_chars.join("");
+    new_hex_chars = "0x".to_string() + new_hex_chars.as_str();
+    new_hex_chars
+}
+pub fn read_state_update_from_file(file_path: &str) -> Result<StateUpdate> {
+    // let file_path = format!("state_update_block_no_{}.txt", block_no);
+    let mut file = File::open(&file_path)?;
+    let mut json = String::new();
+    file.read_to_string(&mut json)?;
+    let state_update: StateUpdate = serde_json::from_str(&json)?;
+    Ok(state_update)
+}
+
 // 239662865362034240643029484020826104800516253213877576945698001454992152761
 async fn send_Tx_4844(block_no: u64) -> Result<()> {
     dotenv().ok();
 
+    let server = MockServer::start();
+
     let provider = JsonRpcClient::new(HttpTransport::new(
-        Url::parse(get_env_var_or_panic("RPC_STARKNET_INFURA_MAIN").as_str())
+        Url::parse((format!("http://localhost:{}", server.port())).as_str())
             .expect("Failed to parse URL"),
     ));
-    let state_update = provider.get_state_update(BlockId::Number(block_no)).await?;
 
-    let state_update = match state_update {
-        MaybePendingStateUpdate::PendingUpdate(_) => {
-            println!("failed for block no {:?}", block_no);
-            return Err(eyre!(
-                "Cannot process block {} for job id  as it's still in pending state",
-                block_no
-            ));
-        }
-        MaybePendingStateUpdate::Update(state_update) => state_update,
-    };
-    let state_update_value = state_update_to_blob_data(block_no, state_update);
+    get_nonce_attached(&server, block_no);
+    // let get_current_nonce = provider
+    //     .get_nonce(
+    //         BlockId::Number(block_no),
+    //         FieldElement::from_hex_be(
+    //             "49d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7",
+    //         )
+    //         .expect("issue while converting the hex to field"),
+    //     )
+    //     .await?;
 
-    let biguint_vec = convert_to_biguint(state_update_value);
-    let BLS_MODULUS: BigUint = BigUint::from_str(
-        "52435875175126190479447740508185965837690552500527637822603658699938581184513",
-    )
-    .unwrap();
-    let xs: Vec<BigUint> = (0..BLOB_LEN)
-        .map(|i| {
-            let bin = format!("{:012b}", i);
-            let bin_rev = bin.chars().rev().collect::<String>();
-            GENERATOR.modpow(&BigUint::from_str_radix(&bin_rev, 2).unwrap(), &BLS_MODULUS)
-        })
-        .collect();
+    let state_update_real =
+        read_state_update_from_file(format!("state_update_from_block_{}.txt", block_no).as_str())
+            .expect("issue while reading");
+    // let state_update = MaybePendingStateUpdate::Update(state_update_real);
+    // let state_update = serde_json::to_value(&state_update).unwrap();
+    // let response = json!({ "id": 1,"jsonrpc":"2.0","result": state_update });
 
-    let write_to_file_v0 =
-        write_biguint_to_file(&xs, format!("eval_points_{}.txt", block_no).as_str())
-            .expect("issue while writing it to the file");
+    // let state_update_mock = server.mock(|when, then| {
+    //     when.path("/").body_contains("starknet_getStateUpdate");
+    //     then.status(200)
+    //         .body(serde_json::to_vec(&response).unwrap());
+    // });
 
-    let data_after_ntt = some_algo_optimized_V2(biguint_vec.clone(), xs, &BLS_MODULUS);
+    // write_state_update_to_file(
+    //     &state_update,
+    //     format!("state_update_from_block_{}.txt", block_no).as_str(),
+    // );
+    let state_update_value =
+        state_update_to_blob_data(block_no, state_update_real, provider).await?;
 
-    let write_to_file_v1 = write_biguint_to_file(
-        &data_after_ntt,
-        format!("state_file_after_ntt_from_block_{}.txt", block_no).as_str(),
-    )
-    .expect("issue while writing it to the file");
+    // let biguint_vec = convert_to_biguint(state_update_value);
+    // // let BLS_MODULUS: BigUint = BigUint::from_str(
+    // //     "52435875175126190479447740508185965837690552500527637822603658699938581184513",
+    // // )
+    // // .unwrap();
+    // let xs: Vec<BigUint> = (0..BLOB_LEN)
+    //     .map(|i| {
+    //         let bin = format!("{:012b}", i);
+    //         let bin_rev = bin.chars().rev().collect::<String>();
+    //         GENERATOR.modpow(&BigUint::from_str_radix(&bin_rev, 2).unwrap(), &BLS_MODULUS)
+    //     })
+    //     .collect();
 
-    let write_to_file_v2 = write_biguint_to_file(
-        &biguint_vec,
-        format!("state_file_from_block_{}.txt", block_no).as_str(),
-    )
-    .expect("issue while writing it to the file");
+    // let write_to_file_v0 =
+    //     write_biguint_to_file(&xs, format!("eval_points_{}.txt", block_no).as_str())
+    //         .expect("issue while writing it to the file");
+
+    // let data_after_ntt = some_algo_optimized_V2(biguint_vec.clone(), xs.clone(), &BLS_MODULUS);
+
+    // let data_after_ifft = ifft(data_after_ntt.clone(), xs, &BLS_MODULUS);
+
+    // let write_to_file_v1 = write_biguint_to_file(
+    //     &data_after_ntt,
+    //     format!("state_file_after_ntt_from_block_{}.txt", block_no).as_str(),
+    // )
+    // .expect("issue while writing it to the file");
+
+    // let write_to_file_v3 = write_biguint_to_file(
+    //     &data_after_ifft,
+    //     format!("state_file_after_ifft_from_block_{}.txt", block_no).as_str(),
+    // )
+    // .expect("issue while writing it to the file");
+
+    // let write_to_file_v2 = write_biguint_to_file(
+    //     &biguint_vec,
+    //     format!("state_file_from_block_{}.txt", block_no).as_str(),
+    // )
+    // .expect("issue while writing it to the file");
 
     // let self_state_diffs = local_serde::parse_state_diffs(biguint_vec.as_slice());
     // let self_state_diffs_json = local_serde::to_json(self_state_diffs.clone());
@@ -118,7 +314,7 @@ async fn send_Tx_4844(block_no: u64) -> Result<()> {
     // let blob_data =
     //     local_serde::parse_file_to_blob_data(format!("./test_blob_ {}.txt", block_no).as_str());
 
-    // // Recover the original data
+    // // // Recover the original data
     // let original_data = blob::recover(blob_data);
 
     // let write_to_file = write_biguint_to_file(
@@ -142,12 +338,12 @@ async fn send_Tx_4844(block_no: u64) -> Result<()> {
     // );
 
     // assert!(
-    //     have_identical_class_declarations(&state_diffs, &self_state_diffs),
-    //     "value of class declaration should be identical"
+    //     state_diffs.unordered_eq(&self_state_diffs),
+    //     "value of data json should be identical"
     // );
 
     // assert!(
-    //     state_diffs.has_same_contract_updates(&self_state_diffs),
+    //     has_same_contract_updates(&state_diffs, &self_state_diffs),
     //     "state diff values should match as well"
     // );
 
@@ -176,10 +372,14 @@ fn some_algo_optimized_V2(arr: Vec<BigUint>, xs: Vec<BigUint>, p: &BigUint) -> V
     let mut transform: Vec<BigUint> = vec![BigUint::zero(); n];
 
     for i in 0..n {
-        println!("on i we are here: {:?}", i);
+        // println!("on i we are here: {:?}", i);
         // let mut xi_pow_j: BigUint = One::one(); // Initialize to xs[i]**0
         for j in (0..n).rev() {
             transform[i] = (transform[i].clone().mul(&xs[i]).add(&arr[j])).rem(p);
+            // println!(
+            //     "data inside the loop -> : {:?},{:?},{:?},{:?},{:?},{:?}",
+            //     i, j, transform[i], xs[i], arr[j], p
+            // );
         }
     }
 
@@ -242,6 +442,22 @@ fn some_algo_optimized_V2(arr: Vec<BigUint>, xs: Vec<BigUint>, p: &BigUint) -> V
 
 fn modulus(a: u64, b: u64) -> u64 {
     (a % b + b) % b // Efficient modulo operation
+}
+
+pub fn write_state_update_to_file(
+    state_update: &StateUpdate,
+    file_path: &str,
+) -> std::io::Result<()> {
+    // Serialize the state update to JSON
+    let json = serde_json::to_string_pretty(state_update).expect("Failed to serialize StateUpdate");
+
+    // Create or open the file
+    let mut file = File::create(file_path)?;
+
+    // Write the serialized data to the file
+    file.write_all(json.as_bytes())?;
+
+    Ok(())
 }
 
 // pub fn fft(arr: Vec<BigUint>, xs: Vec<BigUint>, p: &BigUint) -> Vec<BigUint> {
@@ -380,83 +596,36 @@ fn ntt(arr: Vec<BigUint>, xs: Vec<BigUint>, p: &BigUint) -> Vec<BigUint> {
 
 //     ntt_recursive(arr, xs, p, &wn)
 // }
-impl ContractUpdate {
-    // Helper function to create a key for sorting
-    fn sort_key(&self) -> BigUint {
-        self.address.clone()
+// Trait for unordered equality
+pub trait UnorderedEq {
+    fn unordered_eq(&self, other: &Self) -> bool;
+}
+
+// Implement UnorderedEq for DataJson
+impl UnorderedEq for DataJson {
+    fn unordered_eq(&self, other: &Self) -> bool {
+        self.state_update.unordered_eq(&other.state_update)
+            && self
+                .class_declaration
+                .unordered_eq(&other.class_declaration)
     }
+}
 
-    fn has_same_storage_updates(&self, other: &ContractUpdate) -> bool {
-        let mut self_storage = self.storage_updates.clone();
-        let mut other_storage = other.storage_updates.clone();
-
-        // Sort the storage updates by the unique key
-        self_storage.sort_by_key(|update| update.sort_key_storage());
-        other_storage.sort_by_key(|update| update.sort_key_storage());
-
-        if self_storage.len() != other_storage.len() {
+// Implement UnorderedEq for Vec<ContractUpdate>
+impl UnorderedEq for Vec<ContractUpdate> {
+    fn unordered_eq(&self, other: &Self) -> bool {
+        if self.len() != other.len() {
             return false;
         }
 
-        self_storage
-            .iter()
-            .zip(other_storage.iter())
-            .all(|(self_update, other_update)| self_update == other_update)
-    }
-}
+        let mut self_sorted = self.clone();
+        let mut other_sorted = other.clone();
 
-impl StorageUpdate {
-    // Helper function to create a key for sorting
-    fn sort_key_storage(&self) -> BigUint {
-        self.key.clone()
-    }
-}
-impl PartialEq for ContractUpdate {
-    fn eq(&self, other: &Self) -> bool {
-        println!(
-            "so this is the data in eq, {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, {:?}",
-            self.address,
-            other.address,
-            self.new_class_hash,
-            other.new_class_hash,
-            self.number_of_storage_updates,
-            other.number_of_storage_updates,
-            self.nonce,
-            other.nonce
-        );
+        self_sorted.sort_by_key(|update| update.address.clone());
+        other_sorted.sort_by_key(|update| update.address.clone());
 
-        if (self.new_class_hash != other.new_class_hash) {
-            println!("class hash is not mathcing here");
-        }
-
-        if (self.nonce != other.nonce) {
-            println!("nonce is not mathcing here");
-        }
-
-        self.address == other.address
-            && self.nonce == other.nonce
-            && self.number_of_storage_updates == other.number_of_storage_updates
-            && self.new_class_hash == other.new_class_hash
-            && self.has_same_storage_updates(other)
-        // storage_updates is not compared
-    }
-}
-
-impl DataJson {
-    pub fn has_same_contract_updates(&self, other: &DataJson) -> bool {
-        let mut self_updates = self.state_update.clone();
-        let mut other_updates = other.state_update.clone();
-
-        // Sort the updates by the unique identifier (address)
-        self_updates.sort_by_key(|update| update.sort_key());
-        other_updates.sort_by_key(|update| update.sort_key());
-
-        if self_updates.len() != other_updates.len() {
-            return false;
-        }
-
-        for (update_self, update_other) in self_updates.iter().zip(other_updates.iter()) {
-            if update_self != update_other {
+        for (self_update, other_update) in self_sorted.iter().zip(other_sorted.iter()) {
+            if !self_update.unordered_eq(other_update) {
                 return false;
             }
         }
@@ -464,18 +633,94 @@ impl DataJson {
         true
     }
 }
+
+// Implement UnorderedEq for Vec<ClassDeclaration>
+impl UnorderedEq for Vec<ClassDeclaration> {
+    fn unordered_eq(&self, other: &Self) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+
+        let set_self: HashSet<_> = self.iter().collect();
+        let set_other: HashSet<_> = other.iter().collect();
+
+        set_self == set_other
+    }
+}
+
+// Implement UnorderedEq for Vec<StorageUpdate>
+impl UnorderedEq for Vec<StorageUpdate> {
+    fn unordered_eq(&self, other: &Self) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+
+        let mut self_sorted = self.clone();
+        let mut other_sorted = other.clone();
+
+        self_sorted.sort_by_key(|update| update.key.clone());
+        other_sorted.sort_by_key(|update| update.key.clone());
+
+        self_sorted == other_sorted
+    }
+}
+
+// Implement UnorderedEq for ContractUpdate
+impl UnorderedEq for ContractUpdate {
+    fn unordered_eq(&self, other: &Self) -> bool {
+        self.address == other.address
+            && self.nonce == other.nonce
+            && self.number_of_storage_updates == other.number_of_storage_updates
+            && self.new_class_hash == other.new_class_hash
+            && self.storage_updates.unordered_eq(&other.storage_updates)
+    }
+}
+
+// Implement UnorderedEq for ClassDeclaration
+impl UnorderedEq for ClassDeclaration {
+    fn unordered_eq(&self, other: &Self) -> bool {
+        self.class_hash == other.class_hash && self.compiled_class_hash == other.compiled_class_hash
+    }
+}
+
+// Implement PartialEq for ClassDeclaration for HashSet comparison
+// impl PartialEq for ClassDeclaration {
+//     fn eq(&self, other: &Self) -> bool {
+//         self.class_hash == other.class_hash && self.compiled_class_hash == other.compiled_class_hash
+//     }
+// }
+
+// Implement Eq for ClassDeclaration for HashSet comparison
+// impl Eq for ClassDeclaration {}
+
+// Implement Hash for ClassDeclaration for HashSet comparison
+// impl std::hash::Hash for ClassDeclaration {
+//     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+//         self.class_hash.to_str_radix(10).hash(state);
+//         self.compiled_class_hash.to_str_radix(10).hash(state);
+//     }
+// }
+
+// Implement Hash for ContractUpdate manually
+// impl Hash for ContractUpdate {
+//     fn hash<H: Hasher>(&self, state: &mut H) {
+//         println!("test 1.3");
+//         self.address.to_str_radix(10).hash(state);
+//         self.nonce.hash(state);
+//         self.number_of_storage_updates.hash(state);
+//         self.new_class_hash
+//             .as_ref()
+//             .map(|b| b.to_str_radix(10))
+//             .hash(state);
+//         self.storage_updates.iter().for_each(|su| su.hash(state));
+//     }
+// }
+
 pub fn get_env_var(key: &str) -> Result<String> {
     dotenv().ok();
     let variable_here = env::var(key).expect("PK must be set");
     Ok(variable_here)
     // std::env::var(key).map_err(|e| e.into())
-}
-
-pub fn have_identical_class_declarations(a: &DataJson, b: &DataJson) -> bool {
-    let set_a: HashSet<_> = a.class_declaration.iter().cloned().collect();
-    let set_b: HashSet<_> = b.class_declaration.iter().cloned().collect();
-
-    set_a == set_b
 }
 
 pub fn get_env_var_or_panic(key: &str) -> String {
@@ -488,141 +733,6 @@ fn write_biguint_to_file(numbers: &Vec<BigUint>, file_path: &str) -> io::Result<
         writeln!(file, "{}", number)?;
     }
     Ok(())
-}
-
-fn state_update_to_blob_data(block_no: u64, state_update: StateUpdate) -> Vec<FieldElement> {
-    let state_diff = state_update.state_diff;
-    let mut blob_data: Vec<FieldElement> = vec![
-        // TODO: confirm first three fields
-        // TODO: should be number of unique addresses over here
-        FieldElement::from(state_diff.storage_diffs.len()),
-        FieldElement::ONE,
-        FieldElement::ONE,
-        FieldElement::from(block_no),
-        state_update.block_hash,
-    ];
-
-    let storage_diffs: HashMap<FieldElement, &Vec<StorageEntry>> = state_diff
-        .storage_diffs
-        .iter()
-        .map(|item| (item.address, &item.storage_entries))
-        .collect();
-    let declared_classes: HashMap<FieldElement, FieldElement> = state_diff
-        .declared_classes
-        .iter()
-        .map(|item| (item.class_hash, item.compiled_class_hash))
-        .collect();
-    let deployed_contracts: HashMap<FieldElement, FieldElement> = state_diff
-        .deployed_contracts
-        .iter()
-        .map(|item| (item.address, item.class_hash))
-        .collect();
-    let replaced_classes: HashMap<FieldElement, FieldElement> = state_diff
-        .replaced_classes
-        .iter()
-        .map(|item| (item.contract_address, item.class_hash))
-        .collect();
-    let mut nonces: HashMap<FieldElement, FieldElement> = state_diff
-        .nonces
-        .iter()
-        .map(|item| (item.contract_address, item.nonce))
-        .collect();
-
-    // Loop over storage diffs
-    for (addr, writes) in storage_diffs {
-        // compare_the_field_element_with_da_word(addr, "address was this".to_string());
-
-        let class_flag = deployed_contracts
-            .get(&addr)
-            .or_else(|| replaced_classes.get(&addr));
-
-        let nonce = nonces.remove(&addr);
-        // if (addr
-        //     == FieldElement::from_dec_str(
-        //         "239662865362034240643029484020826104800516253213877576945698001454992152761",
-        //     )
-        //     .unwrap())
-        // {
-        //     println!("we got our target, {:?}", nonce);
-        // }
-        let da_word_here = da_word(class_flag.is_some(), nonce, writes.len() as u64);
-        let (class_flag_here, nonce_here, change_here) = decode_da_word(da_word_here);
-        if (da_word_here
-            == FieldElement::from_dec_str("340282366920938464846880412959984582656").unwrap())
-        {
-            println!(
-                "all the data here is {:?},{:?},{:?},{:?},{:?},{:?},{:?},{:?}, ",
-                addr,
-                class_flag,
-                nonce,
-                writes.len(),
-                da_word_here,
-                class_flag_here,
-                nonce_here,
-                change_here
-            );
-        }
-        //all the data here is None,None,3,FieldElement { inner: 0x0000000000000000000000000000000000000000000000000000000000000003 },false,0,3,
-        //all the data here is None,Some(FieldElement { inner: 0x0000000000000000000000000000000000000000000000000000000000000200 }),0,FieldElement { inner: 0x00000000000000000000000000000000000000000000000100000000000001ff },false,1,511,
-        // all the data here is None,Some(FieldElement { inner: 0x00000000000000000000000000000000000000000000000000000000000004e2 }),0,FieldElement { inner: 0x00000000000000000000000000000000000000000000000100000000000004e1 },false,1,1249,
-
-        if (addr == FieldElement::ONE && da_word_here == FieldElement::ONE) {
-            continue;
-        }
-        blob_data.push(addr);
-        blob_data.push(da_word_here);
-        // compare_the_field_element_with_da_word(
-        //     da_word_here,
-        //     "da word below address was this".to_string(),
-        // );
-
-        if let Some(class_hash) = class_flag {
-            blob_data.push(*class_hash);
-            // compare_the_field_element_with_da_word(
-            //     *class_flag.expect("issue in class flag"),
-            //     "class hash was this".to_string(),
-            // );
-        }
-
-        for entry in writes {
-            blob_data.push(entry.key);
-            blob_data.push(entry.value);
-            // compare_the_field_element_with_da_word(entry.key, "key was this".to_string());
-            // compare_the_field_element_with_da_word(entry.value, "value was this".to_string());
-        }
-    }
-
-    // Handle nonces
-    // for (addr, nonce) in nonces {
-    //     blob_data.push(addr);
-
-    //     let class_flag = deployed_contracts
-    //         .get(&addr)
-    //         .or_else(|| replaced_classes.get(&addr));
-
-    //     blob_data.push(da_word(class_flag.is_some(), Some(nonce), 0_u64));
-    //     if let Some(class_hash) = class_flag {
-    //         blob_data.push(*class_hash);
-    //     }
-    // }
-
-    // // Handle deployed contracts
-    // for (addr, class_hash) in deployed_contracts {
-    //     blob_data.push(addr);
-
-    //     blob_data.push(da_word(true, None, 0_u64));
-    //     blob_data.push(class_hash);
-    // }
-
-    // Handle declared classes
-    blob_data.push(FieldElement::from(declared_classes.len()));
-
-    for (class_hash, compiled_class_hash) in &declared_classes {
-        blob_data.push(*class_hash);
-        blob_data.push(*compiled_class_hash);
-    }
-
-    blob_data
 }
 
 fn da_word(class_flag: bool, nonce_change: Option<FieldElement>, num_changes: u64) -> FieldElement {

@@ -33,3 +33,5 @@ majin-blob-types = "0.1.3"
 num-bigint = "0.4.4"
 serde = { version = "1.0.196", default-features = false, features = ["derive"] }
 rayon = "1.10.0"
+httpmock = { version = "0.7.0" }
+mockall = "0.12.1"
